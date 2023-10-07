@@ -942,6 +942,7 @@ HnswUpdateConnection(HnswElement element, HnswCandidate * hc, int m, int lc, int
 		if (pruned == NULL)
 		{
 			List	   *c = NIL;
+			bool		save_closerSet = hc->element->neighbors[lc].closerSet;
 
 			/* Add and sort candidates */
 			for (int i = 0; i < currentNeighbors->length; i++)
@@ -950,6 +951,61 @@ HnswUpdateConnection(HnswElement element, HnswCandidate * hc, int m, int lc, int
 			list_sort(c, CompareCandidateDistances);
 
 			SelectNeighbors(c, m, lc, procinfo, collation, hc->element, &hc2, &pruned);
+
+			if (save_closerSet)
+			{
+				int			retries;
+				ListCell   *cell;
+				List	   *c_copy = NIL;
+				HnswCandidate *prunedVerify = NULL;
+
+				/*
+				 * Make a copy of the input list 'c' for
+				 * verification. (SelectNeighbors modifies it in place)
+				 */
+				foreach (cell, c)
+				{
+					HnswCandidate *orig = (HnswCandidate *) lfirst(cell);
+					HnswCandidate *copy = palloc(sizeof(HnswCandidate));
+
+					memcpy(copy, orig, sizeof(HnswCandidate));
+					c_copy = lappend(c_copy, copy);
+				}
+
+#define NRETRIES 1000
+				for (retries = 0; retries < NRETRIES; retries++)
+				{
+					if (retries != 0)
+					{
+						/* Shuffle the input */
+						for (int i = 0; i < list_length(c_copy); i++)
+						{
+							int j = i + random() % (list_length(c_copy) - i);
+							ListCell *a = list_nth_cell(c_copy, i);
+							ListCell *b = list_nth_cell(c_copy, j);
+							HnswCandidate tmp;
+
+							tmp = *(HnswCandidate *) lfirst(a);
+							*(HnswCandidate *) lfirst(a) = *(HnswCandidate *) lfirst(b);
+							*(HnswCandidate *) lfirst(b) = tmp;
+						}
+						list_sort(c_copy, CompareCandidateDistances);
+					}
+
+					/* temporarily force SelectNeighbors to recalculate the set */
+					hc->element->neighbors[lc].closerSet = false;
+					SelectNeighbors(c_copy, m, lc, procinfo, collation, hc->element, &hc2, &prunedVerify);
+					hc->element->neighbors[lc].closerSet = true;
+
+					if (prunedVerify->element == pruned->element)
+						break;
+					elog(WARNING, "RETRY %d: pruned: %f, prunedVerify: %f", retries, pruned->distance, prunedVerify->distance);
+				}
+				if (retries == NRETRIES)
+					elog(PANIC, "incremental SelectNeighbors pruned different candidate than full recompute");
+				if (retries > 0)
+					elog(WARNING, "incremental SelectNeighbors pruned different candidate than full recompute, but after recomputing in different order (%d retries), got the same result", retries + 1);
+			}
 
 			/* Should not happen */
 			if (pruned == NULL)
