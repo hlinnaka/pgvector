@@ -453,9 +453,13 @@ BuildCallback(Relation index, CALLBACK_ITEM_POINTER, Datum *values,
 	/* Update progress */
 	if (inserted)
 	{
+		double		indtuples;
+
 		HnswLockAcquire(hnswshared);
-		UpdateProgress(PROGRESS_CREATEIDX_TUPLES_DONE, ++graph->indtuples);
+		indtuples = ++graph->indtuples;
 		HnswLockRelease(hnswshared);
+
+		UpdateProgress(PROGRESS_CREATEIDX_TUPLES_DONE, indtuples);
 	}
 
 	/* Reset memory context */
