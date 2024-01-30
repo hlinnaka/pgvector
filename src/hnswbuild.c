@@ -1089,12 +1089,40 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	SeedRandom(42);
 #endif
 
+#ifdef NEON_SMGR
+	smgr_start_unlogged_build(index->rd_smgr);
+#endif
+
 	InitBuildState(buildstate, heap, index, indexInfo, forkNum);
 
 	BuildGraph(buildstate, forkNum);
 
+#ifdef NEON_SMGR
+	smgr_finish_unlogged_build_phase_1(index->rd_smgr);
+#endif
+
 	if (RelationNeedsWAL(index))
+	{
 		log_newpage_range(index, forkNum, 0, RelationGetNumberOfBlocks(index), true);
+
+#ifdef NEON_SMGR
+		{
+#if PG_VERSION_NUM >= 160000
+			RelFileLocator rlocator = index->rd_smgr->smgr_rlocator.locator;
+#else
+			RelFileNode rlocator = index->rd_smgr->smgr_rnode.node;
+#endif
+
+			SetLastWrittenLSNForBlockRange(XactLastRecEnd, rlocator,
+										   MAIN_FORKNUM, 0, RelationGetNumberOfBlocks(index));
+			SetLastWrittenLSNForRelation(XactLastRecEnd, rlocator, MAIN_FORKNUM);
+		}
+#endif
+	}
+
+#ifdef NEON_SMGR
+	smgr_end_unlogged_build(index->rd_smgr);
+#endif
 
 	FreeBuildState(buildstate);
 }
