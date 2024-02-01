@@ -1090,7 +1090,7 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 #endif
 
 #ifdef NEON_SMGR
-	smgr_start_unlogged_build(index->rd_smgr);
+	smgr_start_unlogged_build(RelationGetSmgr(index));
 #endif
 
 	InitBuildState(buildstate, heap, index, indexInfo, forkNum);
@@ -1098,7 +1098,7 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	BuildGraph(buildstate, forkNum);
 
 #ifdef NEON_SMGR
-	smgr_finish_unlogged_build_phase_1(index->rd_smgr);
+	smgr_finish_unlogged_build_phase_1(RelationGetSmgr(index));
 #endif
 
 	if (RelationNeedsWAL(index))
@@ -1108,9 +1108,9 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 #ifdef NEON_SMGR
 		{
 #if PG_VERSION_NUM >= 160000
-			RelFileLocator rlocator = index->rd_smgr->smgr_rlocator.locator;
+			RelFileLocator rlocator = RelationGetSmgr(index)->smgr_rlocator.locator;
 #else
-			RelFileNode rlocator = index->rd_smgr->smgr_rnode.node;
+			RelFileNode rlocator = RelationGetSmgr(index)->smgr_rnode.node;
 #endif
 
 			SetLastWrittenLSNForBlockRange(XactLastRecEnd, rlocator,
@@ -1121,7 +1121,7 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	}
 
 #ifdef NEON_SMGR
-	smgr_end_unlogged_build(index->rd_smgr);
+	smgr_end_unlogged_build(RelationGetSmgr(index));
 #endif
 
 	FreeBuildState(buildstate);
