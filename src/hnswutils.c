@@ -567,13 +567,12 @@ HnswLoadElement(HnswElement element, float *distance, Datum *q, Relation index, 
 }
 
 /*
- * Get the distance for a candidate
+ * Get the distance between 'hc' and 'q'
  */
 static float
-GetCandidateDistance(dsa_area *base, HnswCandidate * hc, Datum q, FmgrInfo *procinfo, Oid collation)
+GetElementDistance(dsa_area *base, HnswElement hc, Datum q, FmgrInfo *procinfo, Oid collation)
 {
-	HnswElement hce = HnswPtrAccess(base, hc->element);
-	Datum		value = HnswGetValue(base, hce);
+	Datum		value = HnswGetValue(base, hc);
 
 	return DatumGetFloat8(FunctionCall2Coll(procinfo, collation, q, value));
 }
@@ -588,7 +587,7 @@ HnswEntryCandidate(dsa_area *base, HnswElementPtr entryPointPtr, Datum q, Relati
 
 	hc->element = entryPointPtr;
 	if (index == NULL)
-		hc->distance = GetCandidateDistance(base, hc, q, procinfo, collation);
+		hc->distance = GetElementDistance(base, HnswPtrAccess(base, entryPointPtr), q, procinfo, collation);
 	else
 		HnswLoadElement(HnswPtrAccess(base, entryPointPtr), &hc->distance, &q, index, procinfo, collation, loadVec);
 	return hc;
@@ -675,17 +674,14 @@ AddToVisited(dsa_area *base, visited_hash * v, HnswElement element, Relation ind
  * Count element towards ef
  */
 static inline bool
-CountElement(dsa_area *base, HnswElement skipElement, HnswCandidate * hc)
+CountElement(dsa_area *base, HnswElement skipElement, HnswElement e)
 {
-	HnswElement e;
-
 	if (skipElement == NULL)
 		return true;
 
 	/* Ensure does not access heaptidsLength during in-memory build */
 	pg_memory_barrier();
 
-	e = HnswPtrAccess(base, hc->element);
 	return e->heaptidsLength != 0;
 }
 
@@ -717,9 +713,10 @@ HnswSearchLayer(dsa_area *base, Datum q, List *ep, int ef, int lc, Relation inde
 	foreach(lc2, ep)
 	{
 		HnswCandidate *hc = (HnswCandidate *) lfirst(lc2);
+		HnswElement e = HnswPtrAccess(base, hc->element);
 		bool		found;
 
-		AddToVisited(base, &v, HnswPtrAccess(base, hc->element), index, &found);
+		AddToVisited(base, &v, e, index, &found);
 
 		pairingheap_add(C, &(CreatePairingHeapNode(hc)->ph_node));
 		pairingheap_add(W, &(CreatePairingHeapNode(hc)->ph_node));
@@ -729,7 +726,7 @@ HnswSearchLayer(dsa_area *base, Datum q, List *ep, int ef, int lc, Relation inde
 		 * would be ideal to do this for inserts as well, but this could
 		 * affect insert performance.
 		 */
-		if (CountElement(base, skipElement, hc))
+		if (CountElement(base, skipElement, e))
 			wlen++;
 	}
 
@@ -762,8 +759,8 @@ HnswSearchLayer(dsa_area *base, Datum q, List *ep, int ef, int lc, Relation inde
 
 		for (int i = 0; i < neighborhood->length; i++)
 		{
-			HnswCandidate *e = &neighborhood->items[i];
-			HnswElement eElement = HnswPtrAccess(base, e->element);
+			HnswCandidate *hc = &neighborhood->items[i];
+			HnswElement eElement = HnswPtrAccess(base, hc->element);
 			bool		visited;
 
 			AddToVisited(base, &v, eElement, index, &visited);
@@ -775,7 +772,7 @@ HnswSearchLayer(dsa_area *base, Datum q, List *ep, int ef, int lc, Relation inde
 				f = ((HnswPairingHeapNode *) pairingheap_first(W))->inner;
 
 				if (index == NULL)
-					eDistance = GetCandidateDistance(base, e, q, procinfo, collation);
+					eDistance = GetElementDistance(base, eElement, q, procinfo, collation);
 				else
 					HnswLoadElement(eElement, &eDistance, &q, index, procinfo, collation, inserting);
 
@@ -790,7 +787,7 @@ HnswSearchLayer(dsa_area *base, Datum q, List *ep, int ef, int lc, Relation inde
 					/* Copy e */
 					HnswCandidate *ec = palloc(sizeof(HnswCandidate));
 
-					ec->element = e->element;
+					ec->element = hc->element;
 					ec->distance = eDistance;
 
 					pairingheap_add(C, &(CreatePairingHeapNode(ec)->ph_node));
@@ -801,7 +798,7 @@ HnswSearchLayer(dsa_area *base, Datum q, List *ep, int ef, int lc, Relation inde
 					 * vacuuming. It would be ideal to do this for inserts as
 					 * well, but this could affect insert performance.
 					 */
-					if (CountElement(base, skipElement, e))
+					if (CountElement(base, skipElement, eElement))
 					{
 						wlen++;
 
@@ -882,15 +879,12 @@ CompareCandidateDistancesOffset(const void *a, const void *b)
 }
 
 /*
- * Calculate the distance between elements
+ * Calculate the distance between two vectors
  */
 static float
-HnswGetDistance(dsa_area *base, HnswElement a, HnswElement b, FmgrInfo *procinfo, Oid collation)
+HnswGetDistance(Datum a, Datum b, FmgrInfo *procinfo, Oid collation)
 {
-	Datum		aValue = HnswGetValue(base, a);
-	Datum		bValue = HnswGetValue(base, b);
-
-	return DatumGetFloat8(FunctionCall2Coll(procinfo, collation, aValue, bValue));
+	return DatumGetFloat8(FunctionCall2Coll(procinfo, collation, a, b));
 }
 
 /*
@@ -900,13 +894,15 @@ static bool
 CheckElementCloser(dsa_area *base, HnswCandidate * e, List *r, FmgrInfo *procinfo, Oid collation)
 {
 	HnswElement eElement = HnswPtrAccess(base, e->element);
+	Datum		eValue = HnswGetValue(base, eElement);
 	ListCell   *lc2;
 
 	foreach(lc2, r)
 	{
 		HnswCandidate *ri = lfirst(lc2);
 		HnswElement riElement = HnswPtrAccess(base, ri->element);
-		float		distance = HnswGetDistance(base, eElement, riElement, procinfo, collation);
+		Datum		riValue = HnswGetValue(base, riElement);
+		float		distance = HnswGetDistance(eValue, riValue, procinfo, collation);
 
 		if (distance <= e->distance)
 			return false;
@@ -1072,7 +1068,7 @@ HnswUpdateConnection(dsa_area *base, HnswElementPtr elementPtr, HnswCandidate * 
 				if (HnswPtrIsNull(base, hc3Element->value))
 					HnswLoadElement(hc3Element, &hc3->distance, &q, index, procinfo, collation, true);
 				else
-					hc3->distance = GetCandidateDistance(base, hc3, q, procinfo, collation);
+					hc3->distance = GetElementDistance(base, hc3Element, q, procinfo, collation);
 
 				/* Prune element if being deleted */
 				if (hc3Element->heaptidsLength == 0)
