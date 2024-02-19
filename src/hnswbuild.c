@@ -71,8 +71,7 @@
 #endif
 
 #define PARALLEL_KEY_HNSW_SHARED		UINT64CONST(0xA000000000000001)
-#define PARALLEL_KEY_HNSW_AREA			UINT64CONST(0xA000000000000002)
-#define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xA000000000000003)
+#define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xA000000000000002)
 
 #if PG_VERSION_NUM < 130000
 #define GENERATIONCHUNK_RAWSIZE (SIZEOF_SIZE_T + SIZEOF_VOID_P * 2)
@@ -156,7 +155,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 	Buffer		buf;
 	Page		page;
 	HnswElementPtr iter = buildstate->graph->head;
-	char	   *base = buildstate->hnswarea;
+	dsa_area   *base = buildstate->hnswarea;
 
 	/* Calculate sizes */
 	maxSize = HNSW_MAX_SIZE;
@@ -251,7 +250,7 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 	ForkNumber	forkNum = buildstate->forkNum;
 	int			m = buildstate->m;
 	HnswElementPtr iter = buildstate->graph->head;
-	char	   *base = buildstate->hnswarea;
+	dsa_area   *base = buildstate->hnswarea;
 	HnswNeighborTuple ntup;
 
 	/* Allocate once */
@@ -334,7 +333,7 @@ AddDuplicateInMemory(HnswElement element, HnswElement dup)
  * Find duplicate element
  */
 static bool
-FindDuplicateInMemory(char *base, HnswElement element)
+FindDuplicateInMemory(dsa_area *base, HnswElement element)
 {
 	HnswNeighborArray *neighbors = HnswGetNeighbors(base, element, 0);
 	Datum		value = HnswGetValue(base, element);
@@ -361,11 +360,13 @@ FindDuplicateInMemory(char *base, HnswElement element)
  * Add to element list
  */
 static void
-AddElementInMemory(char *base, HnswGraph * graph, HnswElement element)
+AddElementInMemory(dsa_area *base, HnswGraph * graph, HnswElementPtr elementPtr)
 {
+	HnswElement element = HnswPtrAccess(base, elementPtr);
+
 	SpinLockAcquire(&graph->lock);
 	element->next = graph->head;
-	HnswPtrStore(base, graph->head, element);
+	graph->head = elementPtr;
 	SpinLockRelease(&graph->lock);
 }
 
@@ -373,12 +374,14 @@ AddElementInMemory(char *base, HnswGraph * graph, HnswElement element)
  * Update neighbors
  */
 static void
-UpdateNeighborsInMemory(char *base, FmgrInfo *procinfo, Oid collation, HnswElement e, int m)
+UpdateNeighborsInMemory(dsa_area *base, FmgrInfo *procinfo, Oid collation, HnswElementPtr elementPtr, int m)
 {
-	for (int lc = e->level; lc >= 0; lc--)
+	HnswElement element = HnswPtrAccess(base, elementPtr);
+
+	for (int lc = element->level; lc >= 0; lc--)
 	{
 		int			lm = HnswGetLayerM(m, lc);
-		HnswNeighborArray *neighbors = HnswGetNeighbors(base, e, lc);
+		HnswNeighborArray *neighbors = HnswGetNeighbors(base, element, lc);
 
 		for (int i = 0; i < neighbors->length; i++)
 		{
@@ -390,7 +393,7 @@ UpdateNeighborsInMemory(char *base, FmgrInfo *procinfo, Oid collation, HnswEleme
 
 			/* Use element for lock instead of hc since hc can be replaced */
 			LWLockAcquire(&neighborElement->lock, LW_EXCLUSIVE);
-			HnswUpdateConnection(base, e, hc, lm, lc, NULL, NULL, procinfo, collation);
+			HnswUpdateConnection(base, elementPtr, hc, lm, lc, NULL, NULL, procinfo, collation);
 			LWLockRelease(&neighborElement->lock);
 		}
 	}
@@ -400,44 +403,48 @@ UpdateNeighborsInMemory(char *base, FmgrInfo *procinfo, Oid collation, HnswEleme
  * Update graph in memory
  */
 static void
-UpdateGraphInMemory(FmgrInfo *procinfo, Oid collation, HnswElement element, int m, int efConstruction, HnswElement entryPoint, HnswBuildState * buildstate)
+UpdateGraphInMemory(FmgrInfo *procinfo, Oid collation, HnswElementPtr elementPtr, int m, int efConstruction, HnswElement entryPoint, HnswBuildState * buildstate)
 {
 	HnswGraph  *graph = buildstate->graph;
-	char	   *base = buildstate->hnswarea;
+	dsa_area   *base = buildstate->hnswarea;
+	HnswElement element = HnswPtrAccess(base, elementPtr);
 
 	/* Look for duplicate */
 	if (FindDuplicateInMemory(base, element))
 		return;
 
 	/* Add element */
-	AddElementInMemory(base, graph, element);
+	AddElementInMemory(base, graph, elementPtr);
 
 	/* Update neighbors */
-	UpdateNeighborsInMemory(base, procinfo, collation, element, m);
+	UpdateNeighborsInMemory(base, procinfo, collation, elementPtr, m);
 
 	/* Update entry point if needed (already have lock) */
 	if (entryPoint == NULL || element->level > entryPoint->level)
-		HnswPtrStore(base, graph->entryPoint, element);
+		graph->entryPoint = elementPtr;
 }
 
 /*
  * Insert tuple in memory
  */
 static void
-InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
+InsertTupleInMemory(HnswBuildState * buildstate, HnswElementPtr elementPtr)
 {
+	dsa_area   *base = buildstate->hnswarea;
+	HnswElement element = HnswPtrAccess(base, elementPtr);
 	FmgrInfo   *procinfo = buildstate->procinfo;
 	Oid			collation = buildstate->collation;
 	HnswGraph  *graph = buildstate->graph;
+	HnswElementPtr entryPointPtr;
 	HnswElement entryPoint;
 	LWLock	   *entryLock = &graph->entryLock;
 	int			efConstruction = buildstate->efConstruction;
 	int			m = buildstate->m;
-	char	   *base = buildstate->hnswarea;
 
 	/* Get entry point */
 	LWLockAcquire(entryLock, LW_SHARED);
-	entryPoint = HnswPtrAccess(base, graph->entryPoint);
+	entryPointPtr = graph->entryPoint;
+	entryPoint = HnswPtrAccess(base, entryPointPtr);
 
 	/* Prevent concurrent inserts when likely updating entry point */
 	if (entryPoint == NULL || element->level > entryPoint->level)
@@ -453,10 +460,10 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
 	}
 
 	/* Find neighbors for element */
-	HnswFindElementNeighbors(base, element, entryPoint, NULL, procinfo, collation, m, efConstruction, false);
+	HnswFindElementNeighbors(base, elementPtr, entryPointPtr, NULL, procinfo, collation, m, efConstruction, false);
 
 	/* Update graph in memory */
-	UpdateGraphInMemory(procinfo, collation, element, m, efConstruction, entryPoint, buildstate);
+	UpdateGraphInMemory(procinfo, collation, elementPtr, m, efConstruction, entryPoint, buildstate);
 
 	/* Release entry lock */
 	LWLockRelease(entryLock);
@@ -469,12 +476,13 @@ static bool
 InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, HnswBuildState * buildstate)
 {
 	HnswGraph  *graph = buildstate->graph;
+	HnswElementPtr elementPtr;
 	HnswElement element;
 	HnswAllocator *allocator = &buildstate->allocator;
 	Size		valueSize;
-	Pointer		valuePtr;
+	DatumPtr	valuePtr;
 	LWLock	   *flushLock = &graph->flushLock;
-	char	   *base = buildstate->hnswarea;
+	dsa_area   *base = buildstate->hnswarea;
 
 	/* Detoast once for all calls */
 	Datum		value = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
@@ -533,8 +541,8 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	}
 
 	/* Ok, we can proceed to allocate the element */
-	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, allocator);
-	valuePtr = HnswAlloc(allocator, valueSize);
+	elementPtr = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, allocator);
+	valuePtr = HnswAlloc(allocator, base, DatumPtr, valueSize);
 
 	/*
 	 * We have now allocated the space needed for the element, so we don't
@@ -544,14 +552,15 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	LWLockRelease(&graph->allocatorLock);
 
 	/* Copy the datum */
-	memcpy(valuePtr, DatumGetPointer(value), valueSize);
-	HnswPtrStore(base, element->value, valuePtr);
+	memcpy(HnswPtrAccess(base, valuePtr), DatumGetPointer(value), valueSize);
+	element = HnswPtrAccess(base, elementPtr);
+	element->value = valuePtr;
 
 	/* Create a lock for the element */
 	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
 
 	/* Insert tuple */
-	InsertTupleInMemory(buildstate, element);
+	InsertTupleInMemory(buildstate, elementPtr);
 
 	/* Release flush lock */
 	LWLockRelease(flushLock);
@@ -599,13 +608,13 @@ BuildCallback(Relation index, CALLBACK_ITEM_POINTER, Datum *values,
  * Initialize the graph
  */
 static void
-InitGraph(HnswGraph * graph, char *base, long memoryTotal)
+InitGraph(HnswGraph * graph, dsa_area *base, long memoryTotal)
 {
 	/* Initialize the lock tranche if needed */
 	HnswInitLockTranche();
 
-	HnswPtrStore(base, graph->head, (HnswElement) NULL);
-	HnswPtrStore(base, graph->entryPoint, (HnswElement) NULL);
+	HnswPtrStoreNull(base, graph->head);
+	HnswPtrStoreNull(base, graph->entryPoint);
 	graph->memoryUsed = 0;
 	graph->memoryTotal = memoryTotal;
 	graph->flushed = false;
@@ -620,7 +629,7 @@ InitGraph(HnswGraph * graph, char *base, long memoryTotal)
  * Initialize an allocator
  */
 static void
-InitAllocator(HnswAllocator * allocator, void *(*alloc) (Size size, void *state), void *state)
+InitAllocator(HnswAllocator * allocator, VoidPtr (*alloc) (Size size, void *state), void *state)
 {
 	allocator->alloc = alloc;
 	allocator->state = state;
@@ -629,11 +638,13 @@ InitAllocator(HnswAllocator * allocator, void *(*alloc) (Size size, void *state)
 /*
  * Memory context allocator
  */
-static void *
+static VoidPtr
 HnswMemoryContextAlloc(Size size, void *state)
 {
 	HnswBuildState *buildstate = (HnswBuildState *) state;
-	void	   *chunk = MemoryContextAlloc(buildstate->graphCtx, size);
+	VoidPtr	chunk;
+
+	chunk.ptr = MemoryContextAlloc(buildstate->graphCtx, size);
 
 #if PG_VERSION_NUM >= 130000
 	buildstate->graphData.memoryUsed = MemoryContextMemAllocated(buildstate->graphCtx, false);
@@ -647,11 +658,14 @@ HnswMemoryContextAlloc(Size size, void *state)
 /*
  * Shared memory allocator
  */
-static void *
+static VoidPtr
 HnswSharedMemoryAlloc(Size size, void *state)
 {
 	HnswBuildState *buildstate = (HnswBuildState *) state;
-	void	   *chunk = buildstate->hnswarea + buildstate->graph->memoryUsed;
+	dsa_area *base = buildstate->hnswarea;
+	VoidPtr   chunk;
+
+	chunk.dsaptr = dsa_allocate(base, MAXALIGN(size));
 
 	buildstate->graph->memoryUsed += MAXALIGN(size);
 	return chunk;
@@ -763,7 +777,7 @@ ParallelHeapScan(HnswBuildState * buildstate)
  * Perform a worker's portion of a parallel insert
  */
 static void
-HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnswshared, char *hnswarea, bool progress)
+HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnswshared, dsa_area *hnswarea, bool progress)
 {
 	HnswBuildState buildstate;
 	TableScanDesc scan;
@@ -809,7 +823,7 @@ HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc)
 {
 	char	   *sharedquery;
 	HnswShared *hnswshared;
-	char	   *hnswarea;
+	dsa_area   *hnswarea;
 	Relation	heapRel;
 	Relation	indexRel;
 	LOCKMODE	heapLockmode;
@@ -841,10 +855,12 @@ HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc)
 	heapRel = table_open(hnswshared->heaprelid, heapLockmode);
 	indexRel = index_open(hnswshared->indexrelid, indexLockmode);
 
-	hnswarea = shm_toc_lookup(toc, PARALLEL_KEY_HNSW_AREA, false);
+	hnswarea = dsa_attach(hnswshared->hnswarea);
 
 	/* Perform inserts */
 	HnswParallelScanAndInsert(heapRel, indexRel, hnswshared, hnswarea, false);
+
+	dsa_detach(hnswarea);
 
 	/* Close relations within worker */
 	index_close(indexRel, indexLockmode);
@@ -859,6 +875,8 @@ HnswEndParallel(HnswLeader * hnswleader)
 {
 	/* Shutdown worker processes */
 	WaitForParallelWorkersToFinish(hnswleader->pcxt);
+
+	dsa_detach(hnswleader->hnswarea);
 
 	/* Free last reference to MVCC snapshot, if one was used */
 	if (IsMVCCSnapshot(hnswleader->snapshot))
@@ -900,7 +918,7 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 	Size		esthnswarea;
 	Size		estother;
 	HnswShared *hnswshared;
-	char	   *hnswarea;
+	dsa_area   *hnswarea;
 	HnswLeader *hnswleader = (HnswLeader *) palloc0(sizeof(HnswLeader));
 	bool		leaderparticipates = true;
 	int			querylen;
@@ -908,6 +926,8 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 #ifdef DISABLE_LEADER_PARTICIPATION
 	leaderparticipates = false;
 #endif
+
+	hnswarea = dsa_create(hnsw_lock_tranche_id);
 
 	/* Enter parallel mode and create context */
 	EnterParallelMode();
@@ -964,6 +984,7 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 	hnswshared->heaprelid = RelationGetRelid(buildstate->heap);
 	hnswshared->indexrelid = RelationGetRelid(buildstate->index);
 	hnswshared->isconcurrent = isconcurrent;
+	hnswshared->hnswarea = dsa_get_handle(hnswarea);
 	ConditionVariableInit(&hnswshared->workersdonecv);
 	SpinLockInit(&hnswshared->mutex);
 	/* Initialize mutable state */
@@ -973,12 +994,10 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 								  ParallelTableScanFromHnswShared(hnswshared),
 								  snapshot);
 
-	hnswarea = (char *) shm_toc_allocate(pcxt->toc, esthnswarea);
 	/* Report less than allocated so never fails */
 	InitGraph(&hnswshared->graphData, hnswarea, esthnswarea - 1024 * 1024);
 
 	shm_toc_insert(pcxt->toc, PARALLEL_KEY_HNSW_SHARED, hnswshared);
-	shm_toc_insert(pcxt->toc, PARALLEL_KEY_HNSW_AREA, hnswarea);
 
 	/* Store query string for workers */
 	if (debug_query_string)

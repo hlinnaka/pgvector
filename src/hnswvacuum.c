@@ -183,6 +183,8 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
 static void
 RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswElement entryPoint)
 {
+	HnswElementPtr elementPtr = { .ptr = element } ;
+	HnswElementPtr entryPointPtr = { .ptr = entryPoint };
 	Relation	index = vacuumstate->index;
 	Buffer		buf;
 	Page		page;
@@ -194,18 +196,18 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
 	BufferAccessStrategy bas = vacuumstate->bas;
 	HnswNeighborTuple ntup = vacuumstate->ntup;
 	Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m);
-	char	   *base = NULL;
+	dsa_area   *base = NULL;
 
 	/* Skip if element is entry point */
 	if (entryPoint != NULL && element->blkno == entryPoint->blkno && element->offno == entryPoint->offno)
 		return;
 
 	/* Init fields */
-	HnswInitNeighbors(base, element, m, NULL);
+	HnswInitNeighbors(base, element, m, &LOCAL_ALLOC);
 	element->heaptidsLength = 0;
 
 	/* Find neighbors for element, skipping itself */
-	HnswFindElementNeighbors(base, element, entryPoint, index, procinfo, collation, m, efConstruction, true);
+	HnswFindElementNeighbors(base, elementPtr, entryPointPtr, index, procinfo, collation, m, efConstruction, true);
 
 	/* Zero memory for each element */
 	MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);
@@ -300,7 +302,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
 			{
 				/* Reset neighbors from previous update */
 				if (highestPoint != NULL)
-					HnswPtrStore((char *) NULL, highestPoint->neighbors, (HnswNeighborArrayPtr *) NULL);
+					HnswPtrStoreNull((dsa_area *) NULL, highestPoint->neighbors);
 
 				RepairGraphElement(vacuumstate, entryPoint, highestPoint);
 			}

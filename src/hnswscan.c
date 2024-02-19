@@ -20,8 +20,9 @@ GetScanItems(IndexScanDesc scan, Datum q)
 	List	   *ep;
 	List	   *w;
 	int			m;
+	HnswElementPtr entryPointPtr;
 	HnswElement entryPoint;
-	char	   *base = NULL;
+	dsa_area   *base = NULL;
 
 	/* Get m and entry point */
 	HnswGetMetaPageInfo(index, &m, &entryPoint);
@@ -29,7 +30,8 @@ GetScanItems(IndexScanDesc scan, Datum q)
 	if (entryPoint == NULL)
 		return NIL;
 
-	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, procinfo, collation, false));
+	entryPointPtr.ptr = entryPoint;
+	ep = list_make1(HnswEntryCandidate(base, entryPointPtr, q, index, procinfo, collation, false));
 
 	for (int lc = entryPoint->level; lc >= 1; lc--)
 	{
@@ -185,7 +187,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 	while (list_length(so->w) > 0)
 	{
-		char	   *base = NULL;
+		dsa_area   *base = NULL;
 		HnswCandidate *hc = llast(so->w);
 		HnswElement element = HnswPtrAccess(base, hc->element);
 		ItemPointer heaptid;

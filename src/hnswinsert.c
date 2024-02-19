@@ -135,7 +135,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	OffsetNumber freeOffno = InvalidOffsetNumber;
 	OffsetNumber freeNeighborOffno = InvalidOffsetNumber;
 	BlockNumber newInsertPage = InvalidBlockNumber;
-	char	   *base = NULL;
+	dsa_area   *base = NULL;
 
 	/* Calculate sizes */
 	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
@@ -342,7 +342,8 @@ ConnectionExists(HnswElement e, HnswNeighborTuple ntup, int startIdx, int lm)
 void
 HnswUpdateNeighborsOnDisk(Relation index, FmgrInfo *procinfo, Oid collation, HnswElement e, int m, bool checkExisting, bool building)
 {
-	char	   *base = NULL;
+	dsa_area   *base = NULL;
+	HnswElementPtr ePtr = { .ptr = e };
 
 	for (int lc = e->level; lc >= 0; lc--)
 	{
@@ -373,7 +374,7 @@ HnswUpdateNeighborsOnDisk(Relation index, FmgrInfo *procinfo, Oid collation, Hns
 			 */
 
 			/* Select neighbors */
-			HnswUpdateConnection(NULL, e, hc, lm, lc, &idx, index, procinfo, collation);
+			HnswUpdateConnection(NULL, ePtr, hc, lm, lc, &idx, index, procinfo, collation);
 
 			/* New element was not selected as a neighbor */
 			if (idx == -1)
@@ -502,7 +503,7 @@ AddDuplicateOnDisk(Relation index, HnswElement element, HnswElement dup, bool bu
 static bool
 FindDuplicateOnDisk(Relation index, HnswElement element, bool building)
 {
-	char	   *base = NULL;
+	dsa_area   *base = NULL;
 	HnswNeighborArray *neighbors = HnswGetNeighbors(base, element, 0);
 	Datum		value = HnswGetValue(base, element);
 
@@ -556,14 +557,16 @@ UpdateGraphOnDisk(Relation index, FmgrInfo *procinfo, Oid collation, HnswElement
 bool
 HnswInsertTupleOnDisk(Relation index, Datum value, Datum *values, bool *isnull, ItemPointer heap_tid, bool building)
 {
+	HnswElementPtr entryPointPtr;
 	HnswElement entryPoint;
+	HnswElementPtr elementPtr;
 	HnswElement element;
 	int			m;
 	int			efConstruction = HnswGetEfConstruction(index);
 	FmgrInfo   *procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
 	Oid			collation = index->rd_indcollation[0];
 	LOCKMODE	lockmode = ShareLock;
-	char	   *base = NULL;
+	dsa_area   *base = NULL;
 
 	/*
 	 * Get a shared lock. This allows vacuum to ensure no in-flight inserts
@@ -576,8 +579,9 @@ HnswInsertTupleOnDisk(Relation index, Datum value, Datum *values, bool *isnull, 
 	HnswGetMetaPageInfo(index, &m, &entryPoint);
 
 	/* Create an element */
-	element = HnswInitElement(base, heap_tid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
-	HnswPtrStore(base, element->value, DatumGetPointer(value));
+	elementPtr = HnswInitElement(base, heap_tid, m, HnswGetMl(m), HnswGetMaxLevel(m), &LOCAL_ALLOC);
+	element = HnswPtrAccess(base, elementPtr);
+	element->value.ptr = DatumGetPointer(value);
 
 	/* Prevent concurrent inserts when likely updating entry point */
 	if (entryPoint == NULL || element->level > entryPoint->level)
@@ -594,7 +598,8 @@ HnswInsertTupleOnDisk(Relation index, Datum value, Datum *values, bool *isnull, 
 	}
 
 	/* Find neighbors for element */
-	HnswFindElementNeighbors(base, element, entryPoint, index, procinfo, collation, m, efConstruction, false);
+	entryPointPtr.ptr = entryPoint;
+	HnswFindElementNeighbors(base, elementPtr, entryPointPtr, index, procinfo, collation, m, efConstruction, false);
 
 	/* Update graph on disk */
 	UpdateGraphOnDisk(index, procinfo, collation, element, m, efConstruction, entryPoint, building);

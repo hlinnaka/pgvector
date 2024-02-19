@@ -5,10 +5,11 @@
 
 #include "access/genam.h"
 #include "access/parallel.h"
+#include "hnswptr.h"
 #include "lib/pairingheap.h"
 #include "nodes/execnodes.h"
 #include "port.h"				/* for random() */
-#include "utils/relptr.h"
+#include "utils/dsa.h"
 #include "utils/sampling.h"
 #include "vector.h"
 
@@ -97,20 +98,6 @@
 
 #define HnswGetValue(base, element) PointerGetDatum(HnswPtrAccess(base, (element)->value))
 
-#if PG_VERSION_NUM < 140005
-#define relptr_offset(rp) ((rp).relptr_off - 1)
-#endif
-
-/* Pointer macros */
-#define HnswPtrAccess(base, hp) ((base) == NULL ? (hp).ptr : relptr_access(base, (hp).relptr))
-#define HnswPtrStore(base, hp, value) ((base) == NULL ? (void) ((hp).ptr = (value)) : (void) relptr_store(base, (hp).relptr, value))
-#define HnswPtrIsNull(base, hp) ((base) == NULL ? (hp).ptr == NULL : relptr_is_null((hp).relptr))
-#define HnswPtrEqual(base, hp1, hp2) ((base) == NULL ? (hp1).ptr == (hp2).ptr : relptr_offset((hp1).relptr) == relptr_offset((hp2).relptr))
-
-/* For code paths dedicated to each type */
-#define HnswPtrPointer(hp) (hp).ptr
-#define HnswPtrOffset(hp) relptr_offset((hp).relptr)
-
 /* Variables */
 extern int	hnsw_ef_search;
 extern int	hnsw_lock_tranche_id;
@@ -118,16 +105,12 @@ extern int	hnsw_lock_tranche_id;
 typedef struct HnswElementData HnswElementData;
 typedef struct HnswNeighborArray HnswNeighborArray;
 
-#define HnswPtrDeclare(type, relptrtype, ptrtype) \
-	relptr_declare(type, relptrtype); \
-	typedef union { type *ptr; relptrtype relptr; } ptrtype;
-
 /* Pointers that can be absolute or relative */
 /* Use char for DatumPtr so works with Pointer */
-HnswPtrDeclare(HnswElementData, HnswElementRelptr, HnswElementPtr);
-HnswPtrDeclare(HnswNeighborArray, HnswNeighborArrayRelptr, HnswNeighborArrayPtr);
-HnswPtrDeclare(HnswNeighborArrayPtr, HnswNeighborsRelptr, HnswNeighborsPtr);
-HnswPtrDeclare(char, DatumRelptr, DatumPtr);
+HnswPtrDeclare(char, DatumPtr);
+HnswPtrDeclare(HnswElementData, HnswElementPtr);
+HnswPtrDeclare(HnswNeighborArray, HnswNeighborArrayPtr);
+HnswPtrDeclare(HnswNeighborArrayPtr, HnswNeighborsPtr);
 
 typedef struct HnswElementData
 {
@@ -204,6 +187,8 @@ typedef struct HnswShared
 	Oid			indexrelid;
 	bool		isconcurrent;
 
+	dsa_handle	hnswarea;
+
 	/* Worker progress */
 	ConditionVariable workersdonecv;
 
@@ -225,14 +210,8 @@ typedef struct HnswLeader
 	int			nparticipanttuplesorts;
 	HnswShared *hnswshared;
 	Snapshot	snapshot;
-	char	   *hnswarea;
+	dsa_area   *hnswarea;
 }			HnswLeader;
-
-typedef struct HnswAllocator
-{
-	void	   *(*alloc) (Size size, void *state);
-	void	   *state;
-}			HnswAllocator;
 
 typedef struct HnswBuildState
 {
@@ -271,7 +250,7 @@ typedef struct HnswBuildState
 	/* Parallel builds */
 	HnswLeader *hnswleader;
 	HnswShared *hnswshared;
-	char	   *hnswarea;
+	dsa_area   *hnswarea;
 }			HnswBuildState;
 
 typedef struct HnswMetaPageData
@@ -370,24 +349,23 @@ bool		HnswNormValue(FmgrInfo *procinfo, Oid collation, Datum *value, Vector * re
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
-List	   *HnswSearchLayer(char *base, Datum q, List *ep, int ef, int lc, Relation index, FmgrInfo *procinfo, Oid collation, int m, bool inserting, HnswElement skipElement);
+List	   *HnswSearchLayer(dsa_area *base, Datum q, List *ep, int ef, int lc, Relation index, FmgrInfo *procinfo, Oid collation, int m, bool inserting, HnswElement skipElement);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
-void	   *HnswAlloc(HnswAllocator * allocator, Size size);
-HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
+HnswElementPtr HnswInitElement(dsa_area *base, ItemPointer tid, int m, double ml, int maxLevel, const HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
-void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, FmgrInfo *procinfo, Oid collation, int m, int efConstruction, bool existing);
-HnswCandidate *HnswEntryCandidate(char *base, HnswElement em, Datum q, Relation rel, FmgrInfo *procinfo, Oid collation, bool loadVec);
+void		HnswFindElementNeighbors(dsa_area *base, HnswElementPtr element, HnswElementPtr entryPoint, Relation index, FmgrInfo *procinfo, Oid collation, int m, int efConstruction, bool existing);
+HnswCandidate *HnswEntryCandidate(dsa_area *base, HnswElementPtr em, Datum q, Relation rel, FmgrInfo *procinfo, Oid collation, bool loadVec);
 void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
-void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
+void		HnswSetNeighborTuple(dsa_area *base, HnswNeighborTuple ntup, HnswElement e, int m);
 void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
-void		HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * alloc);
+void		HnswInitNeighbors(dsa_area *base, HnswElement element, int m, const HnswAllocator * alloc);
 bool		HnswInsertTupleOnDisk(Relation index, Datum value, Datum *values, bool *isnull, ItemPointer heap_tid, bool building);
 void		HnswUpdateNeighborsOnDisk(Relation index, FmgrInfo *procinfo, Oid collation, HnswElement e, int m, bool checkExisting, bool building);
 void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
 void		HnswLoadElement(HnswElement element, float *distance, Datum *q, Relation index, FmgrInfo *procinfo, Oid collation, bool loadVec);
-void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
-void		HnswUpdateConnection(char *base, HnswElement element, HnswCandidate * hc, int lm, int lc, int *updateIdx, Relation index, FmgrInfo *procinfo, Oid collation);
+void		HnswSetElementTuple(dsa_area *base, HnswElementTuple etup, HnswElement element);
+void		HnswUpdateConnection(dsa_area *base, HnswElementPtr element, HnswCandidate * hc, int lm, int lc, int *updateIdx, Relation index, FmgrInfo *procinfo, Oid collation);
 void		HnswLoadNeighbors(HnswElement element, Relation index, int m);
 void		HnswInitLockTranche(void);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
@@ -409,7 +387,7 @@ bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
 void		hnswendscan(IndexScanDesc scan);
 
 static inline HnswNeighborArray *
-HnswGetNeighbors(char *base, HnswElement element, int lc)
+HnswGetNeighbors(dsa_area *base, HnswElement element, int lc)
 {
 	HnswNeighborArrayPtr *neighborList = HnswPtrAccess(base, element->neighbors);
 
