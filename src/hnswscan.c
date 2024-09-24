@@ -153,9 +153,11 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		 */
 		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
-		so->w = GetScanItems(scan, value);
+		if (hnsw_enable_iterator)
+			HnswInitScan(scan, value);
+		else
+			so->w = GetScanItems(scan, value);
 
-		/* Release shared lock */
 		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
 		so->first = false;
@@ -165,17 +167,38 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 #endif
 	}
 
-	while (list_length(so->w) > 0)
+	while (hnsw_enable_iterator || list_length(so->w) > 0)
 	{
 		char	   *base = NULL;
-		HnswSearchCandidate *hc = llast(so->w);
-		HnswElement element = HnswPtrAccess(base, hc->element);
+		HnswSearchCandidate *hc;
+		HnswElement element;
 		ItemPointer heaptid;
 
+		CHECK_FOR_INTERRUPTS();
+
+		if (hnsw_enable_iterator)
+		{
+			hc = so->hc;
+			if (hc == NULL)
+			{
+				hc = HnswGetNext(base, scan);
+				if (hc == NULL)
+					break;
+				so->hc = hc;
+			}
+		}
+		else
+		{
+			hc = llast(so->w);
+		}
+		element = HnswPtrAccess(base, hc->element);
 		/* Move to next element if no valid heap TIDs */
 		if (element->heaptidsLength == 0)
 		{
-			so->w = list_delete_last(so->w);
+			if (hnsw_enable_iterator)
+				so->hc = NULL;
+			else
+				so->w = list_delete_last(so->w);
 			continue;
 		}
 

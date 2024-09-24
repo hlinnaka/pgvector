@@ -3,6 +3,7 @@
 #include <math.h>
 
 #include "access/generic_xlog.h"
+#include "access/relscan.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_type_d.h"
 #include "common/hashfn.h"
@@ -99,13 +100,6 @@ hash_offset(Size offset)
 #define	SH_SCOPE		extern
 #define SH_DEFINE
 #include "lib/simplehash.h"
-
-typedef union
-{
-	pointerhash_hash *pointers;
-	offsethash_hash *offsets;
-	tidhash_hash *tids;
-}			visited_hash;
 
 typedef union
 {
@@ -628,7 +622,7 @@ HnswEntryCandidate(char *base, HnswElement entryPoint, Datum q, Relation index, 
  * Compare candidate distances
  */
 static int
-CompareNearestCandidates(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+cmp_Cnearest(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 {
 	if (HnswGetSearchCandidateConst(c_node, a)->distance < HnswGetSearchCandidateConst(c_node, b)->distance)
 		return 1;
@@ -639,17 +633,26 @@ CompareNearestCandidates(const pairingheap_node *a, const pairingheap_node *b, v
 	return 0;
 }
 
-/*
- * Compare candidate distances
- */
 static int
-CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+cmp_Wfurthest(const pairingheap_node *a, const pairingheap_node * b, void *arg)
 {
-	if (HnswGetSearchCandidateConst(w_node, a)->distance < HnswGetSearchCandidateConst(w_node, b)->distance)
+	if (HnswGetSearchCandidateConst(Wfurthest_node, a)->distance < HnswGetSearchCandidateConst(Wfurthest_node, b)->distance)
 		return -1;
 
-	if (HnswGetSearchCandidateConst(w_node, a)->distance > HnswGetSearchCandidateConst(w_node, b)->distance)
+	if (HnswGetSearchCandidateConst(Wfurthest_node, a)->distance > HnswGetSearchCandidateConst(Wfurthest_node, b)->distance)
 		return 1;
+
+	return 0;
+}
+
+static int
+cmp_Wnearest(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+{
+	if (HnswGetSearchCandidateConst(Wnearest_node, a)->distance < HnswGetSearchCandidateConst(Wnearest_node, b)->distance)
+		return 1;
+
+	if (HnswGetSearchCandidateConst(Wnearest_node, a)->distance > HnswGetSearchCandidateConst(Wnearest_node, b)->distance)
+		return -1;
 
 	return 0;
 }
@@ -784,14 +787,270 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 }
 
 /*
+ * Initialize a search with the unlimited iterator approach. With the
+ * unlimited iterator, we run the same basic HNSW search algorithm as in
+ * HnswSearchLayer(), but we run it "continuously".
+ *
+ * The unlimited iterator approach is only used for searches, not for
+ * insertions.
+ */
+void
+HnswInitScan(IndexScanDesc scan, Datum q)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	Relation	index = scan->indexRelation;
+	FmgrInfo   *procinfo = so->procinfo;
+	Oid			collation = so->collation;
+	HnswSearchCandidate *hc;
+	List	   *ep;
+	List	   *w;
+	HnswElement entryPoint;
+	bool		visited;
+	char	   *base = NULL;
+
+	so->hc = NULL;
+	so->q = q;
+
+	so->bottom_layer.C = pairingheap_allocate(cmp_Cnearest, NULL);
+	so->bottom_layer.Wnearest = pairingheap_allocate(cmp_Wnearest, NULL);
+	so->bottom_layer.Woverflow = pairingheap_allocate(cmp_Wnearest, NULL);
+	so->bottom_layer.Wfurthest = pairingheap_allocate(cmp_Wfurthest, NULL);
+	so->bottom_layer.Wlen = 0;
+
+	/* Get m and entry point */
+	HnswGetMetaPageInfo(index, &so->m, &entryPoint);
+	if (entryPoint == NULL)
+		return;
+
+	InitVisited(base, &so->bottom_layer.v, index, hnsw_ef_search, so->m);
+
+	/* Search the upper levels as usual */
+	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, procinfo, collation, false));
+	for (int lc = entryPoint->level; lc >= 1; lc--)
+	{
+		w = HnswSearchLayer(base, q, ep, 1, lc, index, procinfo, collation, so->m, false, NULL);
+		ep = w;
+	}
+	hc = (HnswSearchCandidate *) linitial(ep);
+
+	/* Add the entry point to seed the continuous search at the bottom layer */
+	AddToVisited(base, &so->bottom_layer.v, hc->element, scan->indexRelation, &visited);
+	Assert(!visited);
+
+	pairingheap_add(so->bottom_layer.C, &hc->c_node);
+	pairingheap_add(so->bottom_layer.Wnearest, &hc->Wnearest_node);
+	pairingheap_add(so->bottom_layer.Wfurthest, &hc->Wfurthest_node);
+
+	// Note: we're not vacuuming, see CountElement call in HnswSearchLayer
+	so->bottom_layer.Wlen++;
+}
+
+/*
+ * Load candidates into set W, so that we have a set of good-enough candidates
+ * as determined by 'ef' parameter. This is the same algorithm as in
+ * HnswSearchLayer(), but we maintain the dynamic list of candidates W in
+ * continuous fashion. The main differences are:
+ *
+ * 1. We never completely reject a candidate. If a candidate is worse than the
+ * current worst candidate in W, we move it to Woverlow to be reconsidered
+ * later.
+ *
+ * 2. We need to be able to return the current best candidate, one at a time,
+ * instead of building the set of best candidates in one batch. On first call,
+ * we fill the set of best candidates W just like in HnswSearchLayer(). But
+ * once we have a good enough set, instead of returning the whole set, we
+ * return only the best candidate. On next call, we refill W until it again
+ * contains enough good candidates, and return the next best candidate. And so
+ * on.
+ *
+ * In HnswSearchLayer(), 'ef' parameter controls how many candidates to
+ * return. In continuous mode, 'ef' controls how many candidates to maintain
+ * in the pool at all times. For the same index and parameters, the first
+ * candidate to return is the same in both modes, but after that, the
+ * continuous mode can yield slightly different results. The results in
+ * continuous mode are always at least as good as in the one-shot mode, but
+ * because we "top up" the pool of candidates as we go, we might return
+ * elements that are closer to the query vector, after we have already
+ * returned some farther away elements. In other words, in one-shot mode, we
+ * always return 'ef' elements in the right order, but because this is aNN,
+ * they are not necessarily the true nearest elements. In continuous mode, we
+ * return all elements if you keep iterating, but they might not be in the
+ * right order.
+ *
+ * In HnswSearchLayer(), the set of current best candidates W is maintained in
+ * heap W. In continous mode, W is split into two parts, and we need three
+ * heaps in total to track it: Wnearest and Wfurthest contain the current set
+ * of candidates. They contain the same elements, but in different order. They
+ * are equivalent to 'W' in HnswSearchLayer(). The third heap, Woverflow,
+ * contains elements that are worse than the elements in W. When the current
+ * best element is returned from the iterator, we move the next best element
+ * from Woverflow back to W, to keep W full.
+ */
+static void
+LoadCandidates(char *base, IndexScanDesc scan, int ef)
+{
+	int			lc = 0; // FIXME: 0 because this is only used at bottom
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	Relation	index = scan->indexRelation;
+	LayerScanDesc *layer = &so->bottom_layer;
+	HnswNeighborArray *localNeighborhood = NULL;
+	Size		neighborhoodSize = 0;
+	int			lm = HnswGetLayerM(so->m, lc);
+	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
+	int			unvisitedLength;
+
+	/* Create local memory for neighborhood if needed */
+	if (index == NULL)
+	{
+		neighborhoodSize = HNSW_NEIGHBOR_ARRAY_SIZE(lm);
+		localNeighborhood = palloc(neighborhoodSize);
+	}
+
+	/*
+	 * Move entries from Woverflow to W, until we have the required number of
+	 * nodes in W.
+	 */
+	while (!pairingheap_is_empty(layer->Woverflow) && layer->Wlen < ef)
+	{
+		HnswSearchCandidate *o = HnswGetSearchCandidate(Wnearest_node, pairingheap_remove_first(layer->Woverflow));
+
+		pairingheap_add(layer->Wfurthest, &o->Wfurthest_node);
+		pairingheap_add(layer->Wnearest, &o->Wnearest_node);
+		/*
+		 * Do not count elements being deleted towards ef when vacuuming. It
+		 * would be ideal to do this for inserts as well, but this could
+		 * affect insert performance.
+		 */
+		//if (CountElement(skipElement, HnswPtrAccess(base, hc->element)))
+		//if (list_length(o->element->heaptids) != 0)
+			layer->Wlen++;
+	}
+
+	while (!pairingheap_is_empty(layer->C))
+	{
+		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_first(layer->C));
+		HnswSearchCandidate *f = HnswGetSearchCandidate(Wfurthest_node, pairingheap_first(layer->Wfurthest));
+		HnswElement cElement;
+
+		if (c->distance > f->distance && layer->Wlen >= ef)
+			break;				/* we have a good-enough set */
+
+		pairingheap_remove_first(layer->C);
+
+		cElement = HnswPtrAccess(base, c->element);
+
+		if (index == NULL)
+			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, &layer->v, lc, localNeighborhood, neighborhoodSize);
+		else
+			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, &layer->v, index, so->m, lm, lc);
+
+		for (int i = 0; i < unvisitedLength; i++)
+		{
+			HnswElement eElement;
+			HnswSearchCandidate *e;
+			float		eDistance;
+			bool		alwaysAdd = layer->Wlen < ef;
+
+			f = HnswGetSearchCandidate(Wfurthest_node, pairingheap_first(layer->Wfurthest));
+
+			if (index == NULL)
+			{
+				eElement = unvisited[i].element;
+				eDistance = GetElementDistance(base, eElement, so->q, so->procinfo, so->collation);
+			}
+			else
+			{
+				ItemPointer indextid = &unvisited[i].indextid;
+				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
+				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
+
+				/* Avoid any allocations if not adding */
+				eElement = NULL;
+				HnswLoadElementImpl(blkno, offno, &eDistance, &so->q, index, so->procinfo, so->collation, false, alwaysAdd ? NULL : &f->distance, &eElement);
+
+				if (eElement == NULL)
+					continue;
+			}
+
+			Assert(!eElement->deleted);
+
+			/* Make robust to issues */
+			if (eElement->level < lc)
+				continue;
+
+			/* Create a new candidate */
+			e = palloc(sizeof(HnswSearchCandidate));
+			HnswPtrStore(base, e->element, eElement);
+			e->distance = eDistance;
+			pairingheap_add(layer->C, &e->c_node);
+
+			if (!(eDistance < f->distance || alwaysAdd))
+			{
+				pairingheap_add(layer->Woverflow, &e->Wnearest_node);
+				continue;
+			}
+
+			pairingheap_add(layer->Wfurthest, &e->Wfurthest_node);
+			pairingheap_add(layer->Wnearest, &e->Wnearest_node);
+
+			/*
+			 * Do not count elements being deleted towards ef when vacuuming.
+			 * It would be ideal to do this for inserts as well, but this
+			 * could affect insert performance.
+			 * FIXME: not relevant during search
+			 */
+			{
+				layer->Wlen++;
+				if (layer->Wlen > ef)
+				{
+					HnswSearchCandidate *ff;
+
+					ff = pairingheap_container(HnswSearchCandidate, Wfurthest_node, pairingheap_remove_first(layer->Wfurthest));
+					pairingheap_remove(layer->Wnearest, &ff->Wnearest_node);
+					pairingheap_add(layer->Woverflow, &ff->Wnearest_node);
+					layer->Wlen--;
+				}
+			}
+		}
+	}
+
+	//FIXME?? is this needed or do we use a short-lived memory context?
+	pfree(unvisited);
+	if (localNeighborhood)
+		pfree(localNeighborhood);
+}
+
+HnswSearchCandidate *
+HnswGetNext(char *base, IndexScanDesc scan)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	HnswSearchCandidate *hc;
+
+	LoadCandidates(base, scan, hnsw_ef_search);
+
+	if (pairingheap_is_empty(so->bottom_layer.Wnearest))
+	{
+		Assert(so->bottom_layer.Wlen == 0);
+		return NULL;
+	}
+
+	hc = pairingheap_container(HnswSearchCandidate, Wnearest_node, pairingheap_remove_first(so->bottom_layer.Wnearest));
+	pairingheap_remove(so->bottom_layer.Wfurthest, &hc->Wfurthest_node);
+	so->bottom_layer.Wlen--;
+
+	return hc;
+}
+
+
+/*
  * Algorithm 2 from paper
  */
 List *
 HnswSearchLayer(char *base, Datum q, List *ep, int ef, int lc, Relation index, FmgrInfo *procinfo, Oid collation, int m, bool inserting, HnswElement skipElement)
 {
 	List	   *w = NIL;
-	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
-	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
+	pairingheap *C = pairingheap_allocate(cmp_Cnearest, NULL);
+	pairingheap *W = pairingheap_allocate(cmp_Wfurthest, NULL);
 	int			wlen = 0;
 	visited_hash v;
 	ListCell   *lc2;
@@ -819,7 +1078,7 @@ HnswSearchLayer(char *base, Datum q, List *ep, int ef, int lc, Relation index, F
 		AddToVisited(base, &v, hc->element, index, &found);
 
 		pairingheap_add(C, &hc->c_node);
-		pairingheap_add(W, &hc->w_node);
+		pairingheap_add(W, &hc->Wfurthest_node);
 
 		/*
 		 * Do not count elements being deleted towards ef when vacuuming. It
@@ -833,7 +1092,7 @@ HnswSearchLayer(char *base, Datum q, List *ep, int ef, int lc, Relation index, F
 	while (!pairingheap_is_empty(C))
 	{
 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
-		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+		HnswSearchCandidate *f = HnswGetSearchCandidate(Wfurthest_node, pairingheap_first(W));
 		HnswElement cElement;
 
 		if (c->distance > f->distance)
@@ -853,7 +1112,7 @@ HnswSearchLayer(char *base, Datum q, List *ep, int ef, int lc, Relation index, F
 			float		eDistance;
 			bool		alwaysAdd = wlen < ef;
 
-			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+			f = HnswGetSearchCandidate(Wfurthest_node, pairingheap_first(W));
 
 			if (index == NULL)
 			{
@@ -888,7 +1147,7 @@ HnswSearchLayer(char *base, Datum q, List *ep, int ef, int lc, Relation index, F
 			HnswPtrStore(base, e->element, eElement);
 			e->distance = eDistance;
 			pairingheap_add(C, &e->c_node);
-			pairingheap_add(W, &e->w_node);
+			pairingheap_add(W, &e->Wfurthest_node);
 
 			/*
 			 * Do not count elements being deleted towards ef when vacuuming.
@@ -909,10 +1168,13 @@ HnswSearchLayer(char *base, Datum q, List *ep, int ef, int lc, Relation index, F
 	/* Add each element of W to w */
 	while (!pairingheap_is_empty(W))
 	{
-		HnswSearchCandidate *hc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+		HnswSearchCandidate *hc = HnswGetSearchCandidate(Wfurthest_node, pairingheap_remove_first(W));
 
 		w = lappend(w, hc);
 	}
+
+	//FIXME??
+	pfree(unvisited);
 
 	return w;
 }

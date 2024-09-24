@@ -107,6 +107,7 @@
 /* Variables */
 extern int	hnsw_ef_search;
 extern int	hnsw_lock_tranche_id;
+extern bool hnsw_enable_iterator;
 
 typedef struct HnswElementData HnswElementData;
 typedef struct HnswNeighborArray HnswNeighborArray;
@@ -158,7 +159,8 @@ struct HnswNeighborArray
 typedef struct HnswSearchCandidate
 {
 	pairingheap_node c_node;
-	pairingheap_node w_node;
+	pairingheap_node Wfurthest_node;
+	pairingheap_node Wnearest_node;
 	HnswElementPtr element;
 	float		distance;
 }			HnswSearchCandidate;
@@ -325,12 +327,50 @@ typedef struct HnswNeighborTupleData
 
 typedef HnswNeighborTupleData * HnswNeighborTuple;
 
+union visited_hash;
+
+struct pointerhash_hash;
+struct offsethash_hash;
+struct tidhash_hash;
+typedef union
+{
+	struct pointerhash_hash *pointers;
+	struct offsethash_hash *offsets;
+	struct tidhash_hash *tids;
+}			visited_hash;
+
+typedef struct
+{
+	/* Candidates that we have not evaluated yet, i.e their neighours are not in W yet */
+	pairingheap *C;
+
+	/*
+	 * These three heaps maintain the dynamic list W of current candidates.
+	 * It is partitioned into two parts: the top-ef candidates, and the rest.
+	 * Wnearest and Wfurthest always contain the same set of elements, the
+	 * top-ef candidates, but we need two heaps so that we can quickly find
+	 * the furthest or the nearest element. Wlen is the number of elements in
+	 * Wnearest and Wfurthest. Woverflow contains the rest of the candidates,
+	 * nearest at the top.
+	 */
+	pairingheap *Wnearest;
+	pairingheap *Wfurthest;
+	int          Wlen;
+	pairingheap *Woverflow;
+	visited_hash v;
+} LayerScanDesc;
+
 typedef struct HnswScanOpaqueData
 {
 	const		HnswTypeInfo *typeInfo;
 	bool		first;
 	List	   *w;
 	MemoryContext tmpCtx;
+
+	LayerScanDesc bottom_layer;
+	int         m;
+	Datum       q;
+	HnswSearchCandidate *hc;
 
 	/* Support functions */
 	FmgrInfo   *procinfo;
@@ -397,6 +437,8 @@ void		HnswLoadNeighbors(HnswElement element, Relation index, int m);
 void		HnswInitLockTranche(void);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
+HnswSearchCandidate* HnswGetNext(char *base, IndexScanDesc scan);
+void		HnswInitScan(IndexScanDesc scan, Datum q);
 
 /* Index access methods */
 IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);
